@@ -84,24 +84,95 @@ class DeltaShell {
 	}
 
 	func sshExecute(_ cmd: String, on host: String) -> String {
+		if host == "localhost" || host == "127.0.0.1" {
+			// Run locally without SSH
+			let process = Process()
+			let pipe = Pipe()
+			process.standardOutput = pipe
+			process.standardError = pipe
+			process.executableURL = URL(fileURLWithPath: "/bin/bash")
+			process.arguments = ["-c", cmd]
+
+			do {
+				try process.run()
+			} catch {
+				return "Local execution error: \(error)"
+			}
+
+			let data = pipe.fileHandleForReading.readDataToEndOfFile()
+			return String(data: data, encoding: .utf8) ?? "Failed to decode local output"
+		} else {
+			// Run via SSH
+			let process = Process()
+			let pipe = Pipe()
+			process.standardOutput = pipe
+			process.standardError = pipe
+			process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+			process.arguments = ["ssh", host, cmd]
+
+			do {
+				try process.run()
+			} catch {
+				return "SSH error: \(error)"
+			}
+
+			let data = pipe.fileHandleForReading.readDataToEndOfFile()
+			return String(data: data, encoding: .utf8) ?? "Failed to decode SSH output"
+		}
+	}
+
+	func scpBetweenPhases(_ src: String, _ dst: String) -> String {
+		// Expect src and dst like "phase:/path/to/file"
+		guard let srcSep = src.firstIndex(of: ":"),
+			  let dstSep = dst.firstIndex(of: ":") else {
+			return "Invalid SCP syntax. Usage: scp phase:/path phase:/path"
+		}
+
+		let srcPhase = String(src[..<srcSep])
+		let srcPath = String(src[srcSep...].dropFirst())
+		let dstPhase = String(dst[..<dstSep])
+		let dstPath = String(dst[dstSep...].dropFirst())
+
+		guard let srcHost = sshTargets[srcPhase],
+			  let dstHost = sshTargets[dstPhase] else {
+			return "Unknown source or destination phase"
+		}
+
+		// Build scp source and destination strings
+		let srcStr = (srcHost == "localhost" ? srcPath : "\(srcHost):\(srcPath)")
+		let dstStr = (dstHost == "localhost" ? dstPath : "\(dstHost):\(dstPath)")
+
 		let process = Process()
 		let pipe = Pipe()
 		process.standardOutput = pipe
 		process.standardError = pipe
 		process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-		process.arguments = ["ssh", host, cmd]
+		process.arguments = ["scp", srcStr, dstStr]
 
 		do {
 			try process.run()
 		} catch {
-			return "SSH error: \(error)"
+			return "SCP error: \(error)"
 		}
 
 		let data = pipe.fileHandleForReading.readDataToEndOfFile()
-		return String(data: data, encoding: .utf8) ?? "Failed to decode output"
+		return String(data: data, encoding: .utf8) ?? "Failed to decode SCP output"
 	}
 
 	func handle(_ input: String) {
+		// Handle SCP command
+		if input.starts(with: "scp ") {
+			let parts = input.dropFirst(4).split(separator: " ", maxSplits: 1).map { String($0) }
+			if parts.count == 2 {
+				let output = scpBetweenPhases(parts[0], parts[1])
+				print(output)
+			} else {
+				print("Invalid scp command. Usage: scp phaseA:/path phaseB:/path")
+			}
+			return
+		}
+
+		// Existing PHASE: command handling
 		guard input.contains(":") else {
 			print("Use format: PHASE: command")
 			return
@@ -121,13 +192,13 @@ class DeltaShell {
 		node.buffer = cmd
 		let color = phaseColors[phase] ?? "37"
 
-		// Check for logic gate
+		// Logic gate check
 		if let gate = logicGates[phase], !gateEnablers.contains(gate) {
 			print("\u{001B}[\(color)m[Phase \(phase)] Blocked: Gate \(gate) not enabled\u{001B}[0m")
 			return
 		}
 
-		// Gate-enabling logic
+		// Enable gate command
 		if cmd == "enable \(phase)" {
 			gateEnablers.insert(phase)
 			print("\u{001B}[\(color)m[Logic] Enabled phase \(phase)\u{001B}[0m")
@@ -139,7 +210,7 @@ class DeltaShell {
 			transformer.pass(color: color)
 		}
 
-		// Execute via SSH
+		// Execute command
 		if let target = sshTargets[phase] {
 			print("\u{001B}[\(color)m[Phase \(phase)] Executing remotely on \(target)...\u{001B}[0m")
 			let output = sshExecute(cmd, on: target)
@@ -150,8 +221,8 @@ class DeltaShell {
 	}
 
 	func run() {
-		print("🔌 DeltaShell v2.0 — Infinite Phases, SSH, Colors")
-		print("Format: PHASE: command | Type 'exit' to quit\n")
+		print("🔌 DeltaShell v2.1 — SCP Between Phases, Local Exec, Colors")
+		print("Format: PHASE: command | scp phaseA:/src phaseB:/dst | Type 'exit' to quit\n")
 
 		while true {
 			print(">>> ", terminator: "")
