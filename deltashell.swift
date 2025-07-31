@@ -1,12 +1,34 @@
 import Foundation
 
+// MARK: - Node
+
 class Node {
     var buffer: String = ""
     let name: String
     init(_ name: String) { self.name = name }
 }
 
-class Transformer {
+// MARK: - Transformer protocol and base
+
+protocol Transformer {
+    var name: String { get }
+    var input: Node { get }
+    var output: Node { get }
+    
+    func pass(color: String)
+}
+
+extension Transformer {
+    func pass(color: String) {
+        // Default just copy buffer
+        output.buffer = input.buffer
+        print("\u{001B}[\(color)m[\(name)] Passed: \(input.buffer)\u{001B}[0m")
+    }
+}
+
+// MARK: - Example Transformers
+
+class EnvSetupTransformer: Transformer {
     let name: String
     let input: Node
     let output: Node
@@ -15,12 +37,80 @@ class Transformer {
         self.input = input
         self.output = output
     }
-
     func pass(color: String) {
-        output.buffer = input.buffer
-        print("\u{001B}[\(color)m[\(name)] Passed: \(input.buffer)\u{001B}[0m")
+        let envSetup = "export PATH=/custom/bin:$PATH; "
+        output.buffer = envSetup + input.buffer
+        print("\u{001B}[\(color)m[\(name)] Env prepended: \(output.buffer)\u{001B}[0m")
     }
 }
+
+class LoggingTransformer: Transformer {
+    let name: String
+    let input: Node
+    let output: Node
+    init(name: String, input: Node, output: Node) {
+        self.name = name
+        self.input = input
+        self.output = output
+    }
+    func pass(color: String) {
+        print("[LOG][\(name)] Command passed: \(input.buffer)")
+        output.buffer = input.buffer
+    }
+}
+
+class FilterTransformer: Transformer {
+    let name: String
+    let input: Node
+    let output: Node
+    init(name: String, input: Node, output: Node) {
+        self.name = name
+        self.input = input
+        self.output = output
+    }
+    func pass(color: String) {
+        if input.buffer.contains("rm -rf") {
+            output.buffer = "echo 'Command blocked for safety!'"
+            print("\u{001B}[\(color)m[\(name)] Dangerous command blocked\u{001B}[0m")
+        } else {
+            output.buffer = input.buffer
+        }
+    }
+}
+
+class EncryptTransformer: Transformer {
+    let name: String
+    let input: Node
+    let output: Node
+    init(name: String, input: Node, output: Node) {
+        self.name = name
+        self.input = input
+        self.output = output
+    }
+    func pass(color: String) {
+        // Simple placeholder encryption example: reverse string + tag
+        output.buffer = String(input.buffer.reversed())
+        print("\u{001B}[\(color)m[\(name)] Command encrypted\u{001B}[0m")
+    }
+}
+
+class JsonToYamlTransformer: Transformer {
+    let name: String
+    let input: Node
+    let output: Node
+    init(name: String, input: Node, output: Node) {
+        self.name = name
+        self.input = input
+        self.output = output
+    }
+    func pass(color: String) {
+        // Stub: just note conversion
+        output.buffer = "---\nconverted: yaml\noriginal:\n\(input.buffer)"
+        print("\u{001B}[\(color)m[\(name)] Converted JSON to YAML (stub)\u{001B}[0m")
+    }
+}
+
+// MARK: - Persistent SSH Session
 
 class PersistentSSHSession {
     let host: String
@@ -70,28 +160,20 @@ class PersistentSSHSession {
             let data = handle.availableData
             if data.count > 0, let output = String(data: data, encoding: .utf8) {
                 self.outputBuffer += output
-                // print("[\(self.host) partial output]: \(output)")
 
-                // Check if doneMarker is in output buffer
                 if self.outputBuffer.contains(self.doneMarker) {
-                    // Extract output before marker
                     let parts = self.outputBuffer.components(separatedBy: self.doneMarker)
                     let commandOutput = parts[0]
 
-                    // Call callback with trimmed output
                     if let current = self.commandQueue.first {
                         current.1(commandOutput.trimmingCharacters(in: .whitespacesAndNewlines))
                     }
 
-                    // Remove current command from queue
                     if !self.commandQueue.isEmpty {
                         self.commandQueue.removeFirst()
                     }
 
-                    // Remove everything up to marker (including marker)
                     self.outputBuffer = parts.dropFirst().joined(separator: self.doneMarker)
-
-                    // Mark not busy, send next command if any
                     self.isBusy = false
                     self.trySendNext()
                 }
@@ -109,7 +191,6 @@ class PersistentSSHSession {
         guard let (cmd, _) = commandQueue.first else { return }
         isBusy = true
 
-        // Append echo doneMarker to detect command end
         let fullCommand = "\(cmd); echo \(doneMarker)\n"
         if let data = fullCommand.data(using: .utf8) {
             stdinPipe.fileHandleForWriting.write(data)
@@ -123,9 +204,11 @@ class PersistentSSHSession {
     }
 }
 
+// MARK: - DeltaShell
+
 class DeltaShell {
     var nodes: [String: Node] = [:]
-    var transformers: [String: Transformer] = [:]
+    var transformersPerNode: [String: [Transformer]] = [:] // Multiple transformers per node
     var sshTargets: [String: String] = [:]
     var phaseColors: [String: String] = [:]
     var logicGates: [String: String] = [:]
@@ -135,7 +218,7 @@ class DeltaShell {
 
     init() {
         loadConfig()
-        setupTransformers()
+        setupNodesAndTransformers()
         setupSessions()
     }
 
@@ -162,6 +245,7 @@ class DeltaShell {
                     continue
                 }
                 nodes[key] = Node(key)
+                nodes[key + "_OUT"] = Node(key + "_OUT")
                 phaseColors[key] = color
                 sshTargets[key] = ssh
             }
@@ -177,21 +261,32 @@ class DeltaShell {
         }
     }
 
-    func setupTransformers() {
-        for (from, to) in sshTargets.keys.map({ ($0, $0 + "_OUT") }) {
-            let input = nodes[from] ?? Node(from)
-            let output = Node(to)
-            nodes[to] = output
-            let transformer = Transformer(name: "T\(from)", input: input, output: output)
-            transformers[from] = transformer
+    func setupNodesAndTransformers() {
+        // Clear old transformers
+        transformersPerNode.removeAll()
+
+        // Register example transformer plugins per phase node
+        for phase in sshTargets.keys {
+            // Base nodes
+            guard let inputNode = nodes[phase], let outputNode = nodes[phase + "_OUT"] else { continue }
+
+            // Example: multiple transformers chained: EnvSetup -> Filter -> Logging -> Encrypt
+            let transformers: [Transformer] = [
+                EnvSetupTransformer(name: "EnvSetup_\(phase)", input: inputNode, output: outputNode),
+                FilterTransformer(name: "Filter_\(phase)", input: outputNode, output: outputNode),
+                LoggingTransformer(name: "Logger_\(phase)", input: outputNode, output: outputNode),
+                EncryptTransformer(name: "Encrypt_\(phase)", input: outputNode, output: outputNode)
+                // You could add JsonToYamlTransformer here if output processing needed
+            ]
+
+            transformersPerNode[phase] = transformers
         }
     }
 
     func setupSessions() {
         for (phase, host) in sshTargets {
             if host == "localhost" || host == "127.0.0.1" {
-                // No persistent SSH session needed for localhost, use direct execution
-                sshSessions[phase] = nil
+                sshSessions[phase] = nil // Local execution
             } else {
                 sshSessions[phase] = PersistentSSHSession(host: host)
             }
@@ -203,7 +298,7 @@ class DeltaShell {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh") // or get from SHELL env var
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-c", cmd]
 
         do {
@@ -252,6 +347,18 @@ class DeltaShell {
         return String(data: data, encoding: .utf8) ?? "Failed to decode SCP output"
     }
 
+    func runTransformers(for phase: String, color: String) {
+        guard let transformers = transformersPerNode[phase], var inputNode = nodes[phase] else { return }
+
+        // Chain transformers in order, passing buffer along
+        for transformer in transformers {
+            transformer.pass(color: color)
+            // Update inputNode to transformer’s output for next transformer in chain
+            // This is safe because transformers in this design share output node references,
+            // but if different outputs used, would need proper chaining.
+        }
+    }
+
     func handle(_ input: String) {
         if input.starts(with: "scp ") {
             let parts = input.dropFirst(4).split(separator: " ", maxSplits: 1).map { String($0) }
@@ -294,18 +401,16 @@ class DeltaShell {
             return
         }
 
-        if let transformer = transformers[phase] {
-            transformer.pass(color: color)
-        }
+        runTransformers(for: phase, color: color)
 
         if let target = sshTargets[phase] {
-            print("\u{001B}[\(color)m[Phase \(phase)] Executing on \(target)...\u{001B}[0m")
-
             if target == "localhost" || target == "127.0.0.1" {
-                let output = executeLocal(cmd)
+                print("\u{001B}[\(color)m[Phase \(phase)] Executing locally...\u{001B}[0m")
+                let output = executeLocal(nodes[phase + "_OUT"]?.buffer ?? cmd)
                 print("\u{001B}[\(color)m[Output]\n\(output)\u{001B}[0m")
             } else if let session = sshSessions[phase] {
-                session.sendCommand(cmd) { output in
+                print("\u{001B}[\(color)m[Phase \(phase)] Executing remotely on \(target)...\u{001B}[0m")
+                session.sendCommand(nodes[phase + "_OUT"]?.buffer ?? cmd) { output in
                     print("\u{001B}[\(color)m[Output]\n\(output)\u{001B}[0m")
                 }
             } else {
@@ -315,21 +420,23 @@ class DeltaShell {
     }
 
     func run() {
-        print("🔌 DeltaShell v3.0 — Persistent SSH, SCP, Local Exec, Colors")
-        print("Format: PHASE: command | scp phaseA:/src phaseB:/dst | Type 'exit' to quit\n")
+        print("🔌 DeltaShell v4 — Transformers & Plugins, SCP, Local/Remote, Colors")
+        print("Format: PHASE: command | scp phase:/path phase:/path | Type 'exit' to quit\n")
 
         while true {
             print(">>> ", terminator: "")
             guard let line = readLine(), line != "exit" else { break }
             handle(line)
+            // Small delay to allow async SSH output
+            usleep(200_000)
         }
 
-        // Close all sessions on exit
-        for (_, session) in sshSessions {
-            session.close()
-        }
+        // Close sessions on exit
+        sshSessions.values.forEach { $0?.close() }
     }
 }
+
+// MARK: - Run
 
 let shell = DeltaShell()
 shell.run()
